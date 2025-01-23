@@ -68,8 +68,8 @@
 /* USER CODE BEGIN PV */
 
 // bufory na odbior i wysylanie przez UART
-#define USART_TXBUF_LEN 719 //Liczba bajtów bufora nadawczego
-#define USART_RXBUF_LEN 1432 //Liczba bajtów bufora odbiorczego
+#define USART_TXBUF_LEN 1512 //Liczba bajtów bufora nadawczego
+#define USART_RXBUF_LEN 128 //Liczba bajtów bufora odbiorczego
 uint8_t USART_TxBuf[USART_TXBUF_LEN];//tworzenie bufora nadawczego
 uint8_t USART_RxBuf[USART_RXBUF_LEN];//tworzenie bufora odbiorczego
 
@@ -77,6 +77,8 @@ __IO int USART_TX_Empty=0; //wskaźniki zapisu (empty) i odczytu(busy)
 __IO int USART_TX_Busy=0;
 __IO int USART_RX_Empty=0;
 __IO int USART_RX_Busy=0;
+
+// TODO: bufory kolowe do poprawy, kodowanie, zapisywanie
 
 // stany maszyny stanow odbierajacej ramke
 typedef enum
@@ -105,19 +107,16 @@ uint16_t param_length = 0; // dlugosc parametrow jako liczba
 uint16_t data_index = 0;   // indeks w aktualnie czytanym polu
 
 // bufor na "odkodowane" dane (bez byte stuffing)
-uint8_t raw_data[719];
+uint8_t raw_data[713];
 uint16_t raw_length = 0;
 
 // bufory na pola ramki
 uint8_t sender_address[ADDRESS_LENGTH];                 // adres nadawcy
 uint8_t receiver_address[ADDRESS_LENGTH];               // adres odbiorcy
-uint8_t param_length_digits[PARAM_LENGTH_DIGITS]; // dlugosc parametrow
+uint8_t param_length_digits[PARAM_LENGTH_DIGITS + 1]; // dlugosc parametrow + 1 na null terminator
 uint8_t command[COMMAND_LENGTH];                  // komenda
 uint8_t parameters[MAX_PARAM_LENGTH];             // parametry
 uint8_t crc_bytes[CRC_MAX_LENGTH];                // suma kontrolna
-
-// TODO: zmienic?? tablica znakow np. "ACKN" dla zwracanej komendy
-char return_command[COMMAND_LENGTH];
 
 // struktura na konfiguracje PWM
 typedef struct
@@ -152,13 +151,6 @@ uint32_t timer_period = 0;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-//uint8_t USART_kbhit() { // Sprawdzenie czy tablica przypadkiem nie jest pusta
-//    if (USART_RX_Empty == USART_RX_Busy) {
-//        return 0;
-//    } else {
-//        return 1;
-//    }
-//} // USART_kbhit
 
 int16_t USART_getchar() { // Pobranie znaku
     int16_t tmp;
@@ -173,35 +165,9 @@ int16_t USART_getchar() { // Pobranie znaku
         return -1;
     }
 } // USART_getchar
-//
-//uint8_t USART_getline(char *buf) {
-//    static uint8_t bf[128];
-//    static uint8_t idx = 0;
-//    int i;
-//    uint8_t ret;
-//
-//    while (USART_kbhit()) { // Sprawdza czy wskaźnik odczytu i zapisu są na tym samym miejscu
-//        bf[idx] = USART_getchar();
-//        if ((bf[idx] == 10) || (bf[idx] == 13)) {
-//            bf[idx] = 0;
-//            for (i = 0; i <= idx; i++) {
-//                buf[i] = bf[i]; // Przekopiuj do bufora
-//            }
-//            ret = idx;
-//            idx = 0;
-//            return ret; // Odebrano linię
-//        } else { // Jeśli tekst dłuższy, to zawijamy - trudno
-//            idx++;
-//            if (idx >= 128) {
-//                idx = 0;
-//            }
-//        }
-//    }
-//    return 0;
-//} // USART_getline
 
 void USART_fsend(char *format, ...) {
-    char tmp_rs[719];
+    char tmp_rs[1436];
     int i;
     __IO int idx;
     va_list arglist;
@@ -268,6 +234,44 @@ uint16_t crc16_ccitt_false(uint16_t crc, uint8_t *data, uint16_t length);
 bool StartPWMGeneration();
 bool StopPWMGeneration();
 bool ConfigurePWM(PWM_Config *config);
+
+void FrameSend(char *format, ...) {
+	char tmp_frame[717] = {};
+	char formatted_frame[1436] = {};
+	int i;
+	uint16_t frame_index = 0;
+	va_list arglist;
+
+	va_start(arglist, format);
+	vsprintf(tmp_frame, format, arglist);
+	va_end(arglist);
+
+	size_t length = strlen(tmp_frame);
+	uint16_t calculated_crc = crc16_ccitt_false(0xFFFF, (uint8_t *) tmp_frame, (uint8_t) length);
+
+	for (i = 0; i < length; i++) {
+		switch (tmp_frame[i])
+		{
+			case '{':
+				formatted_frame[frame_index++] = '~';
+				formatted_frame[frame_index++] = '[';
+				break;
+			case '}':
+				formatted_frame[frame_index++] = '~';
+				formatted_frame[frame_index++] = ']';
+				break;
+			case '~':
+				formatted_frame[frame_index++] = '~';
+				formatted_frame[frame_index++] = '^';
+				break;
+			default:
+				formatted_frame[frame_index++] = tmp_frame[i];
+				break;
+		}
+	}
+
+	USART_fsend("{%s%04X}", formatted_frame, calculated_crc);
+}
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -411,12 +415,6 @@ void FrameRead()
     {
         uint8_t character = (uint8_t) temp_char;
 
-        if (character == 0)
-		{
-			USART_fsend("NULL DETECTED: \\x%02X\n\r", character);
-			return;
-		}
-
         if (frame_length == 0 && character != '{') {
 			return;
 		}
@@ -426,7 +424,8 @@ void FrameRead()
 			reset_state();
 		}
 
-        if (frame_length > 1432)
+        // TODO: Frame nigdy nie osiagnie wiekszej wartosci bo dekoduje w locie
+        if (frame_length > 719)
         {
         	reset_state();
         	return;
@@ -434,12 +433,11 @@ void FrameRead()
 
         if (frame_length > 0 && frame_length < 18 && character == '}')
         {
-			USART_fsend("est");
         	reset_state();
         	return;
         }
 
-        if (frame_length > 0 && character == '~')
+        if (frame_length > 0 && character == '~' && escape_next != 1)
         {
         	escape_next = 1;
         	return;
@@ -451,7 +449,8 @@ void FrameRead()
 
         	if (decoded_character == 0)
         	{
-        		USART_fsend("{STM%s000BTER}", sender_address);
+//        		USART_fsend("{STM%s000BTER}", sender_address);
+        		FrameSend("STM%s000BTER", sender_address);
         		reset_state();
         		return;
         	}
@@ -473,10 +472,6 @@ void FrameRead()
 				break;
 
 			case READ_SENDER_ADDR:
-				if (data_index >= ADDRESS_LENGTH)
-				{
-					return;
-				}
 
 				frame_length++;
 				sender_address[data_index++] = character;
@@ -490,10 +485,6 @@ void FrameRead()
 				break;
 
 			case READ_RECEIVER_ADDR:
-				if (data_index >= ADDRESS_LENGTH)
-				{
-					return;
-				}
 
 				frame_length++;
 				receiver_address[data_index++] = character;
@@ -513,10 +504,6 @@ void FrameRead()
 				break;
 
 			case READ_PARAM_LENGTH:
-				if (data_index >= PARAM_LENGTH_DIGITS)
-				{
-					return;
-				}
 
 				if (character < '0' || character > '9')
 				{
@@ -529,11 +516,13 @@ void FrameRead()
 
 				if (data_index == PARAM_LENGTH_DIGITS)
 				{
-					param_length = atoi(param_length_digits);
+					param_length_digits[PARAM_LENGTH_DIGITS] = '\0';
+					param_length = atoi((char *) param_length_digits);
 
 					if (param_length > MAX_PARAM_LENGTH)
 					{
-						USART_fsend("{STM%s000DLNE}", sender_address);
+//						USART_fsend("{STM%s000DLNE}", sender_address);
+						FrameSend("STM%s000DLNE", sender_address);
 						reset_state();
 						return;
 					}
@@ -545,10 +534,6 @@ void FrameRead()
 				break;
 
 			case READ_COMMAND:
-				if (data_index >= COMMAND_LENGTH)
-				{
-					return;
-				}
 
 				frame_length++;
 				command[data_index++] = character;
@@ -561,12 +546,6 @@ void FrameRead()
 				break;
 
 			case READ_PARAMETERS:
-				if (data_index >= param_length)
-				{
-					USART_fsend("{STM%s000DLNE}", sender_address);
-					reset_state();
-					return;
-				}
 
 				if (character < '0' || character > '9')
 				{
@@ -586,11 +565,6 @@ void FrameRead()
 				break;
 
 			case READ_CRC:
-				if (data_index >= CRC_MAX_LENGTH)
-				{
-					reset_state();
-					return;
-				}
 
 				if (!((character >= '0' && character <= '9') || (character >= 'A' && character <= 'F') ||
 					  (character >= 'a' && character <= 'f')))
@@ -620,11 +594,11 @@ void FrameRead()
 				frame_length++;
 
 				crc_collector = crc16_ccitt_false(0xFFFF, raw_data, raw_length);
-				uint16_t received_crc = (uint16_t)strtol(crc_bytes, NULL, 16);
+				uint16_t received_crc = (uint16_t)strtol((char *) crc_bytes, NULL, 16);
 
 				if (crc_collector != received_crc)
 				{
-					USART_fsend("{STM%s000CRCE}", sender_address);
+					FrameSend("STM%s000CRCE", sender_address);
 					// debug fsend
 					USART_fsend("\n\rCRC %04X\n\r", crc_collector);
 					reset_state();
@@ -645,12 +619,12 @@ void FrameRead()
 
 void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters, uint16_t param_length)
 {
-    if (strncmp(command, "CPWM", COMMAND_LENGTH) == 0)
+    if (memcmp(command, "CPWM", COMMAND_LENGTH) == 0)
     {
         // sprawdz czy mamy dokladnie 7 znakow (4 freq + 3 duty)
         if (param_length != 7)
         {
-        	USART_fsend("{STM%s000PWME}", sender_address);
+        	FrameSend("STM%s000PWME", sender_address);
             return;
         }
 
@@ -667,7 +641,7 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
 
         if (freq < 1 || freq > 9999 || duty > 100 || duty < 0)
         {
-        	USART_fsend("{STM%s000PWME}", sender_address);
+        	FrameSend("STM%s000PWME", sender_address);
             return;
         }
 
@@ -678,19 +652,19 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
         // sprobuj skonfigurowac timer
         if (!ConfigurePWM(&current_pwm))
         {
-        	USART_fsend("{STM%s000PWME}", sender_address);
+        	FrameSend("STM%s000PWME");
             return;
         }
 
-        USART_fsend("{STM%s000ACKN}", sender_address);
+        FrameSend("STM%s000ACKN", sender_address);
     }
-    else if (strncmp(command, "SPTR", COMMAND_LENGTH) == 0)
+    else if (memcmp(command, "SPTR", COMMAND_LENGTH) == 0)
     {
         // sprawdz czy liczba znakow jest ok (wielokrotnosc 7)
         if (param_length % 7 != 0 ||
             param_length / 7 > 100)
         {
-        	USART_fsend("{STM%s000PTNE}", sender_address);
+        	FrameSend("STM%s000PTNE", sender_address);
             return;
         }
 
@@ -717,7 +691,7 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
             // sprawdz wartosci
             if (period < 1 || period > 9999 || duty > 100 || duty < 0)
             {
-            	USART_fsend("{STM%s000PTNE}", sender_address);
+            	FrameSend("STM%s000PTNE", sender_address);
                 return;
             }
 
@@ -726,25 +700,25 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
             pattern_buffer[i].duty = duty;
         }
 
-        USART_fsend("{STM%s000ACKN}", sender_address);
+        FrameSend("STM%s000ACKN", sender_address);
     }
-    else if (strncmp(command, "GCPW", COMMAND_LENGTH) == 0)
+    else if (memcmp(command, "GCPW", COMMAND_LENGTH) == 0)
     {
         if (param_length != 0)
         {
-        	USART_fsend("{STM%s000PARE}", sender_address);
+        	FrameSend("STM%s000PARE", sender_address);
             return;
         }
 
         if (current_pwm.frequency == 0 && current_pwm.duty == 0)
         {
-        	USART_fsend("{STM%s000NSDT}", sender_address);
+        	FrameSend("STM%s000NSDT", sender_address);
         	return;
         }
 
-        USART_fsend("{STM%s007ACKN%04lu%03u}", sender_address, current_pwm.frequency, current_pwm.duty);
+        FrameSend("STM%s007ACKN%04lu%03u", sender_address, current_pwm.frequency, current_pwm.duty);
     }
-    else if (strncmp(command, "STRT", COMMAND_LENGTH) == 0)
+    else if (memcmp(command, "STRT", COMMAND_LENGTH) == 0)
     {
     	if (dma_running == 1)
 		{
@@ -753,73 +727,73 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
 
     	if (param_length != 0)
 		{
-			USART_fsend("{STM%s000PARE}", sender_address);
+    		FrameSend("STM%s000PARE", sender_address);
 			return;
 		}
 
         if (StartPWMGeneration())
         {
             dma_running = 1;
-            USART_fsend("{STM%s000ACKN}", sender_address);
+            FrameSend("STM%s000ACKN", sender_address);
         }
         else
         {
-        	USART_fsend("{STM%s000DMER}", sender_address);
+        	FrameSend("STM%s000DMER", sender_address);
         }
     }
-    else if (strncmp(command, "STOP", COMMAND_LENGTH) == 0)
+    else if (memcmp(command, "STOP", COMMAND_LENGTH) == 0)
     {
     	if (param_length != 0)
 		{
-			USART_fsend("{STM%s000PARE}", sender_address);
+    		FrameSend("STM%s000PARE", sender_address);
 			return;
 		}
 
     	if (dma_running == 0)
     	{
-    		USART_fsend("{STM%s000DMSE}", sender_address);
+    		FrameSend("STM%s000DMSE", sender_address);
     		return;
     	}
 
         if (StopPWMGeneration())
         {
             dma_running = 0;
-            USART_fsend("{STM%s000ACKN}", sender_address);
+            FrameSend("STM%s000ACKN", sender_address);
         }
         else
         {
-        	USART_fsend("{STM%s000DMSE}", sender_address);
+        	FrameSend("STM%s000DMSE", sender_address);
         }
     }
-    else if (strncmp(command, "STAT", COMMAND_LENGTH) == 0)
+    else if (memcmp(command, "STAT", COMMAND_LENGTH) == 0)
     {
         if (param_length != 0)
         {
-        	USART_fsend("{STM%s000PARE}", sender_address);
+        	FrameSend("STM%s000PARE", sender_address);
             return;
         }
 
         if (dma_running == 1)
         {
-        	USART_fsend("{STM%s000ACTV}", sender_address);
+        	FrameSend("STM%s000ACTV", sender_address);
         }
         else
         {
-        	USART_fsend("{STM%s000NOAC}", sender_address);
+        	FrameSend("STM%s000NOAC", sender_address);
         }
     }
-    else if (strncmp(command, "GPTR", COMMAND_LENGTH) == 0)
+    else if (memcmp(command, "GPTR", COMMAND_LENGTH) == 0)
     {
         if (param_length != 0)
         {
-        	USART_fsend("{STM%s000PARE}", sender_address);
+        	FrameSend("STM%s000PARE", sender_address);
             return;
         }
 
         // jesli nie ma zadnych wzorcow
         if (pattern_count == 0)
         {
-        	USART_fsend("{STM%s000NSDT}", sender_address);
+        	FrameSend("STM%s000NSDT", sender_address);
             return;
         }
 
@@ -836,11 +810,11 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
             strncat(patterns, pattern_str, 7);
         }
 
-        USART_fsend("{STM%s%03uACKN%s}", sender_address, pattern_count * 7, patterns);
+        FrameSend("STM%s%03uACKN%s", sender_address, pattern_count * 7, patterns);
     }
     else
     {
-    	USART_fsend("{STM%s000CMNF}", sender_address);
+    	FrameSend("STM%s000CMNF", sender_address);
     }
 }
 
