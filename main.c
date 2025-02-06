@@ -68,7 +68,7 @@
 /* USER CODE BEGIN PV */
 
 // bufory na odbior i wysylanie przez UART
-#define USART_TXBUF_LEN 1512 //Liczba bajtów bufora nadawczego
+#define USART_TXBUF_LEN 5744 //Liczba bajtów bufora nadawczego
 #define USART_RXBUF_LEN 128 //Liczba bajtów bufora odbiorczego
 uint8_t USART_TxBuf[USART_TXBUF_LEN];//tworzenie bufora nadawczego
 uint8_t USART_RxBuf[USART_RXBUF_LEN];//tworzenie bufora odbiorczego
@@ -78,7 +78,7 @@ __IO int USART_TX_Busy=0;
 __IO int USART_RX_Empty=0;
 __IO int USART_RX_Busy=0;
 
-// TODO: bufory kolowe do poprawy, kodowanie, zapisywanie
+// TODO: zwiekszyc bufor nadawczy, dodac walidacje na komendy CPWM, SPTR
 
 // stany maszyny stanow odbierajacej ramke
 typedef enum
@@ -116,7 +116,7 @@ uint8_t receiver_address[ADDRESS_LENGTH];               // adres odbiorcy
 uint8_t param_length_digits[PARAM_LENGTH_DIGITS + 1]; // dlugosc parametrow + 1 na null terminator
 uint8_t command[COMMAND_LENGTH];                  // komenda
 uint8_t parameters[MAX_PARAM_LENGTH];             // parametry
-uint8_t crc_bytes[CRC_MAX_LENGTH];                // suma kontrolna
+uint8_t crc_bytes[CRC_MAX_LENGTH + 1];                // suma kontrolna + 1 na null terminator
 
 // struktura na konfiguracje PWM
 typedef struct
@@ -138,8 +138,8 @@ PWM_Config current_pwm = {0, 0};
 Pattern_Entry pattern_buffer[MAX_PATTERN_COUNT];
 // ile wzorcow jest w buforze
 uint16_t pattern_count = 0;
-// czy DMA dziala
-uint8_t dma_running = 0;
+// czy PWM dziala
+uint8_t pwm_running = 0;
 
 // bufor na wartosci PWM dla DMA
 uint32_t pwm_buffer[MAX_PATTERN_COUNT];
@@ -186,7 +186,7 @@ void USART_fsend(char *format, ...) {
     }
 
     __disable_irq(); // Wyłączamy przerwania
-    if ((USART_TX_Empty == USART_TX_Busy) && (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE) == SET)) {
+    if ((USART_TX_Empty == USART_TX_Busy) && (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_TXE) == SET)) { // transmit data register empty
         // Sprawdzić dodatkowo zajętość bufora nadajnika
         USART_TX_Empty = idx;
         uint8_t tmp = USART_TxBuf[USART_TX_Busy];
@@ -236,8 +236,8 @@ bool StopPWMGeneration();
 bool ConfigurePWM(PWM_Config *config);
 
 void FrameSend(char *format, ...) {
-	char tmp_frame[717] = {};
-	char formatted_frame[1436] = {};
+	char tmp_frame[713] = {}; // surowe dane bez kodowania, bez sumy kontrolnej, znaku startu, stopu
+	char formatted_frame[1430] = {}; // dane zakodowane bez sumy kontrolnej, znaku startu i stopu
 	int i;
 	uint16_t frame_index = 0;
 	va_list arglist;
@@ -424,7 +424,6 @@ void FrameRead()
 			reset_state();
 		}
 
-        // TODO: Frame nigdy nie osiagnie wiekszej wartosci bo dekoduje w locie
         if (frame_length > 719)
         {
         	reset_state();
@@ -449,8 +448,6 @@ void FrameRead()
 
         	if (decoded_character == 0)
         	{
-//        		USART_fsend("{STM%s000BTER}", sender_address);
-        		FrameSend("STM%s000BTER", sender_address);
         		reset_state();
         		return;
         	}
@@ -521,7 +518,6 @@ void FrameRead()
 
 					if (param_length > MAX_PARAM_LENGTH)
 					{
-//						USART_fsend("{STM%s000DLNE}", sender_address);
 						FrameSend("STM%s000DLNE", sender_address);
 						reset_state();
 						return;
@@ -546,12 +542,6 @@ void FrameRead()
 				break;
 
 			case READ_PARAMETERS:
-
-				if (character < '0' || character > '9')
-				{
-					reset_state();
-					return;
-				}
 
 				frame_length++;
 				parameters[data_index++] = character;
@@ -579,6 +569,7 @@ void FrameRead()
 				if (data_index == CRC_MAX_LENGTH)
 				{
 					data_index = 0;
+					crc_bytes[CRC_MAX_LENGTH] = '\0';
 					state = WAIT_FOR_FOOTER;
 				}
 
@@ -628,6 +619,16 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
             return;
         }
 
+        uint8_t i;
+        for (i = 0; i < param_length; i++) {
+        	char character = parameters[i];
+
+        	if (character < '0' || character > '9') {
+        		FrameSend("STM%s000PWME", sender_address);
+				return;
+        	}
+        }
+
         char freq_str[FREQ_DIGITS + 1];
         memcpy(freq_str, parameters, FREQ_DIGITS);
         freq_str[FREQ_DIGITS] = '\0'; // null-terminator
@@ -668,11 +669,21 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
             return;
         }
 
+        uint16_t i;
+        for (i = 0; i < param_length; i++) {
+        	char character = parameters[i];
+
+			if (character < '0' || character > '9') {
+				FrameSend("STM%s000PTNE", sender_address);
+				return;
+			}
+        }
+
         // policz ile wzorcow przyszlo
         pattern_count = param_length / 7;
 
         // dla kazdego wzorca
-        for (uint16_t i = 0; i < pattern_count; i++)
+        for (i = 0; i < pattern_count; i++)
         {
             // wez 4 znaki na okres
             char period_str[PERIOD_DIGITS + 1];
@@ -720,7 +731,7 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
     }
     else if (memcmp(command, "STRT", COMMAND_LENGTH) == 0)
     {
-    	if (dma_running == 1)
+    	if (pwm_running == 1)
 		{
 			return;
 		}
@@ -733,12 +744,12 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
 
         if (StartPWMGeneration())
         {
-            dma_running = 1;
+            pwm_running = 1;
             FrameSend("STM%s000ACKN", sender_address);
         }
         else
         {
-        	FrameSend("STM%s000DMER", sender_address);
+        	FrameSend("STM%s000PWER", sender_address);
         }
     }
     else if (memcmp(command, "STOP", COMMAND_LENGTH) == 0)
@@ -749,20 +760,20 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
 			return;
 		}
 
-    	if (dma_running == 0)
+    	if (pwm_running == 0)
     	{
-    		FrameSend("STM%s000DMSE", sender_address);
+    		FrameSend("STM%s000PWST", sender_address);
     		return;
     	}
 
         if (StopPWMGeneration())
         {
-            dma_running = 0;
+            pwm_running = 0;
             FrameSend("STM%s000ACKN", sender_address);
         }
         else
         {
-        	FrameSend("STM%s000DMSE", sender_address);
+        	FrameSend("STM%s000PWST", sender_address);
         }
     }
     else if (memcmp(command, "STAT", COMMAND_LENGTH) == 0)
@@ -773,7 +784,7 @@ void ProcessCommand(uint8_t *sender_addr, uint8_t *command, uint8_t *parameters,
             return;
         }
 
-        if (dma_running == 1)
+        if (pwm_running == 1)
         {
         	FrameSend("STM%s000ACTV", sender_address);
         }
@@ -873,7 +884,7 @@ bool StartPWMGeneration()
 {
     if (pattern_count > 0)
     {
-        // konfiguracja DMA
+        // konfiguracja wypełnienia według sekwencji
         for (uint16_t i = 0; i < pattern_count; i++)
         {
             pwm_buffer[i] = (timer_period * pattern_buffer[i].duty) / 100;
